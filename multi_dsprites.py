@@ -1,0 +1,594 @@
+import os
+import argparse
+
+import numpy as np
+import scipy.ndimage as nd
+import tensorflow as tf
+
+from tensorflow.examples.tutorials.mnist import input_data
+from utils.checkpoints import plot_image, pile_image
+
+
+def show_image(image):
+    import matplotlib.pyplot as plt
+
+    plt.imshow(image, cmap="gray", vmin=0.0, vmax=1.0)
+    plt.show()
+
+
+def read_image(path, max_intensity):
+    image = nd.imread(path, mode="L")
+    image = np.asarray(image, dtype=np.float32) / 255.0
+    img_min, img_max = image.min(), image.max()
+
+    if img_min != img_max:
+        if img_min > 0.0:
+            image -= img_min
+        if img_max > 0.0:
+            image /= img_max
+        if max_intensity < 1.0:
+            image *= max_intensity
+    else:
+        if img_max > max_intensity:
+            image = np.ones_like(image) * max_intensity
+
+    return image
+
+
+def crop_non_empty(image):
+    non_zero_row_ids = np.array(np.nonzero(np.sum(image, axis=0)))[0]
+    non_zero_col_ids = np.array(np.nonzero(np.sum(image, axis=1)))[0]
+    x_start, x_end = non_zero_row_ids[0], non_zero_row_ids[-1]
+    y_start, y_end = non_zero_col_ids[0], non_zero_col_ids[-1]
+
+    center_x, length_x = (x_start + x_end) / 2., x_end - x_start
+    center_y, length_y = (y_start + y_end) / 2., y_end - y_start
+    length = max(length_x, length_y) / 2.
+    y_start, y_end = int(center_y - length), int(center_y + length)
+    x_start, x_end = int(center_x - length), int(center_x + length)
+
+    # print(x_start, x_end, y_start, y_end)
+
+    return image[y_start:y_end + 1, x_start:x_end + 1]
+
+
+def add_buffer(image, buffer_width):
+    b = buffer_width
+    w, h = image.shape
+    result = np.copy(image)
+
+    for x in range(w):
+        for y in range(h):
+            if image[y, x] > 0:
+                for i in range(x - b, x + b + 1):
+                    for j in range(y - b, y + b + 1):
+                        if (0 <= i < w and 0 <= j < h) and result[j, i] == 0:
+                            result[j, i] = 1.0
+
+    return result
+
+
+def pixels_overlap(canvas, image, x, y):
+    h, w = image.shape
+    window = canvas[y:y + h, x:x + w]
+
+    return not np.array_equal(np.maximum(image, window), image + window)
+
+
+def bounding_boxes_overlap(x, y, w, h, positions, boxes, gap):
+    for i in range(len(positions) // 2):
+        p, b = positions[i * 2:(i + 1) * 2], boxes[i * 2:(i + 1) * 2]
+        l1x, l1y, r1x, r1y = x - gap, y - gap, x + w + gap - 1, y + h + gap - 1
+        l2x, l2y, r2x, r2y = p[0], p[1], p[0] + b[0] - 1, p[1] + b[1] - 1
+
+        if l1x <= r2x and l2x <= r1x:
+            return True
+        if l1y >= r2y and l2y >= r1y:
+            return True
+
+    return False
+
+
+def generate_multi_image(
+        single_images,
+        num_images,
+        image_dim,
+        canvas_dim,
+        bg=None,
+        min_w=1.0,
+        max_w=1.0,
+        min_h=1.0,
+        max_h=1.0,
+        min_ang=0.0,
+        max_ang=0.0,
+        gap=0,
+        margin=0,
+        use_pixel_overlap=False,
+        location_constrains=lambda x, y: True,
+        share_size=False,
+):
+
+    global digit_ids, next_digit_id, used_digit_ids
+
+    ready = False
+    while not ready:
+        canvas = np.zeros([canvas_dim, canvas_dim], dtype=single_images[0].dtype)
+
+        placed_image_ids = []
+        placed_image_positions = []
+        placed_image_boxes = []
+
+        shared_size = np.random.uniform(min_w, max_w)
+
+        if num_digits == 0:
+            break
+
+        try:
+            for i in range(num_images):
+                idx = digit_ids[next_digit_id]
+                next_digit_id += 1
+                if next_digit_id >= len(digit_ids):
+                    digit_ids = np.random.permutation(digit_ids)
+                    next_digit_id = 0
+
+                image = np.reshape(single_images[idx], [image_dim, image_dim])
+                image = crop_non_empty(image)
+
+                if min_w != 1.0 or max_w != 1.0 or min_h != 1.0 or max_h != 1.0:
+                    if share_size is False:
+                        new_width = np.random.uniform(min_w, max_w)
+                        # new_height = np.random.uniform(min_h, max_h)
+                        new_height = new_width
+                    else:
+                        new_width = new_height = shared_size
+
+                    image = nd.affine_transform(
+                        image,
+                        matrix=np.array([[1.0 / new_height, 0.0],
+                                         [0.0, 1.0 / new_width]]),
+                        output_shape=(
+                            int(image_dim * new_height),
+                            int(image_dim * new_width),
+                        ),
+                        order=5,
+                    )
+
+                    image = np.clip(image, 0.0, 1.0)
+                    image = np.where(image >= 0.05, image, np.zeros_like(image))
+                    image = crop_non_empty(image)
+
+                if min_ang != 0.0 or max_ang != 0.0:
+                    new_angle = np.random.uniform(min_ang, max_ang)
+
+                    image = nd.rotate(image, new_angle, order=5)
+
+                    image = np.clip(image, 0.0, 1.0)
+                    image = np.where(image >= 0.05, image, np.zeros_like(image))
+                    image = crop_non_empty(image)
+
+                h, w = image.shape
+                position_find_attempts = 0
+                position_found = False
+
+                while position_find_attempts < 100:
+                    x = np.random.randint(margin, canvas_dim - w - margin + 1)
+                    y = np.random.randint(margin, canvas_dim - h - margin + 1)
+                    if location_constrains(x / canvas_dim, y / canvas_dim) is not True:
+                        continue
+
+                    if i == 0:
+                        position_found = True
+                    else:
+                        if use_pixel_overlap:
+                            position_found = not pixels_overlap(
+                                canvas_with_buffer, image, x, y)
+                        else:
+                            position_found = not bounding_boxes_overlap(
+                                x,
+                                y,
+                                w,
+                                h,
+                                placed_image_positions,
+                                placed_image_boxes,
+                                gap,
+                            )
+
+                    if position_found:
+                        break
+
+                    position_find_attempts += 1
+
+                if position_found:
+                    canvas[y:y + h, x:x + w] += image
+
+                    if use_pixel_overlap and num_digits > 1:
+                        canvas_with_buffer = (add_buffer(canvas, gap)
+                                              if gap > 0 else canvas)
+
+                    placed_image_positions.extend([x, y])
+                    placed_image_boxes.extend([w, h])
+                    placed_image_ids.append(idx)
+
+                    if i == num_images - 1:
+                        ready = True
+                else:
+                    break
+
+        except IndexError:
+            pass
+
+    if bg is not None:
+        canvas = np.clip(canvas + bg, 0.0, 1.0)
+
+    return canvas, placed_image_ids, placed_image_positions, placed_image_boxes
+
+
+def write_to_records(filename, images, indices, positions, boxes, labels, digits):
+
+    def _int64_list_feature(value):
+        return tf.train.Feature(int64_list=tf.train.Int64List(value=value))
+
+    def _bytes_feature(value):
+        return tf.train.Feature(bytes_list=tf.train.BytesList(value=[value]))
+
+    rows, cols = images[0].shape
+
+    writer = tf.python_io.TFRecordWriter(filename + ".tfrecords")
+    for index in range(len(images)):
+        example = tf.train.Example(
+            features=tf.train.Features(
+                feature={
+                    "height":
+                    _int64_list_feature([rows]),
+                    "width":
+                    _int64_list_feature([cols]),
+                    "digits":
+                    _int64_list_feature([digits[index]]),
+                    "indices":
+                    _bytes_feature(
+                        np.asarray(indices[index], dtype=np.int32).tostring()),
+                    "positions":
+                    _bytes_feature(
+                        np.asarray(positions[index], dtype=np.int32).tostring()),
+                    "boxes":
+                    _bytes_feature(np.asarray(boxes[index], dtype=np.int32).tostring()),
+                    "labels":
+                    _bytes_feature(
+                        np.asarray(labels[index], dtype=np.int32).tostring()),
+                    "image":
+                    _bytes_feature(np.ravel(images[index]).tostring()),
+                }))
+        writer.write(example.SerializeToString())
+    writer.close()
+
+
+def shuffle_lists(*lists):
+    shuffled = []
+
+    perm = np.random.permutation(range(len(lists[0])))
+
+    for l in lists:
+        shuffled.append(np.array([l[i] for i in perm]))
+
+    return shuffled
+
+
+def read_and_decode(fqueue, batch_size, canvas_size, num_threads, max_capacity=10000):
+    reader = tf.TFRecordReader()
+    key, value = reader.read(fqueue)
+
+    features = tf.parse_single_example(
+        value,
+        features={
+            "image": tf.FixedLenFeature([], tf.string),
+            "digits": tf.FixedLenFeature([], tf.int64),
+        },
+    )
+
+    batch = tf.train.shuffle_batch(
+        [
+            tf.reshape(
+                tf.decode_raw(features["image"], tf.float32),
+                [canvas_size * canvas_size],
+            ),
+            tf.cast(features["digits"], tf.int32),
+        ],
+        batch_size=batch_size,
+        capacity=min(10000, max_capacity) + batch_size * 10,
+        min_after_dequeue=max_capacity,
+        num_threads=num_threads,
+    )
+
+    return batch
+
+
+def read_test_data(filename, shift_zero_digits_images=False):
+    record_iterator = tf.python_io.tf_record_iterator(path=filename)
+
+    images_list, digits_list = [], []
+    indices_list, positions_list = [], []
+    boxes_list, labels_list = [], []
+    for string_record in record_iterator:
+        example = tf.train.Example()
+        example.ParseFromString(string_record)
+
+        images_list.append(
+            np.fromstring(
+                example.features.feature["image"].bytes_list.value[0],
+                dtype=np.float32))
+        digits_list.append(int(example.features.feature["digits"].int64_list.value[0]))
+
+        indices_list.append(
+            np.fromstring(
+                example.features.feature["indices"].bytes_list.value[0],
+                dtype=np.int32)[:digits_list[-1]])
+        positions_list.append(
+            np.fromstring(
+                example.features.feature["positions"].bytes_list.value[0],
+                dtype=np.int32,
+            )[:digits_list[-1] * 2])
+        boxes_list.append(
+            np.fromstring(
+                example.features.feature["boxes"].bytes_list.value[0],
+                dtype=np.int32)[:digits_list[-1] * 2])
+        labels_list.append(
+            np.fromstring(
+                example.features.feature["labels"].bytes_list.value[0],
+                dtype=np.int32)[:digits_list[-1]])
+
+    empty = [i for i in range(len(digits_list)) if digits_list[i] == 0]
+    non_empty = [i for i in range(len(digits_list)) if digits_list[i] > 0]
+
+    if shift_zero_digits_images and len(empty) > 0:
+        images_list, digits_list = np.array(images_list), np.array(digits_list)
+        images_list = np.concatenate([
+            np.array([images_list[empty[0]]]),
+            images_list[non_empty],
+            images_list[empty[1:]],
+        ])
+        digits_list = np.concatenate([
+            np.array([digits_list[empty[0]]]),
+            digits_list[non_empty],
+            digits_list[empty[1:]],
+        ])
+
+    return (
+        images_list,
+        digits_list,
+        indices_list,
+        positions_list,
+        boxes_list,
+        labels_list,
+    )
+
+
+def right_half(x, y):
+    if x > 0.5 and y < 0.1:
+        return True
+    else:
+        return False
+
+
+if __name__ == "__main__":
+
+    SAVER_TFRECORDS = False
+    # NUM_IN_COMMON = [0, 2]
+    # NUM_IN_COMMON = [1, 4]
+    # NUM_IN_COMMON = [3]
+    NUM_IN_COMMON = [4]
+    DEFAULT_MAX_DIGITS = max(NUM_IN_COMMON)
+    DEFAULT_IMAGES_PER_DIGIT = 2000
+    DEFAULT_TEST_SET_SIZE = 1000
+
+    CONSTRAINS = lambda x, y: True
+    NAME_SURFIX = ""
+    # CONSTRAINS = right_half
+    # NAME_SURFIX = "right_half"
+
+    MNIST_FOLDER = "./data/multi_dsprites/"
+    MULTI_MNIST_FOLDER = "./data/multi_dsprites/"
+
+    CANVAS_SIZE = 64
+    IMAGE_SIZE = 30
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--max-digits", type=int, choices=list(range(7)), default=DEFAULT_MAX_DIGITS)
+    # parser.add_argument("--max-in-common", type=int,
+    #                     choices=list(range(7)), default=DEFAULT_MAX_IN_COMMON)
+    parser.add_argument(
+        "--images-per-digit", type=int, default=DEFAULT_IMAGES_PER_DIGIT)
+    parser.add_argument("--test-set-size", type=int, default=DEFAULT_TEST_SET_SIZE)
+    parser.add_argument("--digit-gap", type=int, default=0)
+    parser.add_argument("--canvas-margin", type=int, default=0)
+    parser.add_argument("--bg-path", default="")
+    parser.add_argument("--bg-max-intensity", type=float, default=1.0)
+    parser.add_argument("--min-width-scale", type=float, default=1.0)
+    parser.add_argument("--max-width-scale", type=float, default=1.0)
+    parser.add_argument("--min-height-scale", type=float, default=1.0)
+    parser.add_argument("--max-height-scale", type=float, default=1.0)
+    parser.add_argument("--min-rotation-angle", type=float, default=0.0)
+    parser.add_argument("--max-rotation-angle", type=float, default=0.0)
+    parser.add_argument("--use-bounding-box-overlap", action="store_true")
+    parser.add_argument("--name_surfix", type=str, default=NAME_SURFIX)
+    parser.add_argument("--shared_size", type=str, default="false")
+    parser.set_defaults(use_bounding_box_overlap=False)
+    args = parser.parse_args()
+
+    name_of_common = args.name_surfix
+    for item in NUM_IN_COMMON:
+        name_of_common += str(item)
+
+    args.shared_size = args.shared_size.lower() in ["true", "t", "1"]
+
+    print(args.use_bounding_box_overlap)
+    if SAVER_TFRECORDS is False:
+        print("Warning!!!! No tfrecords will be saved")
+
+    if not os.path.exists(MULTI_MNIST_FOLDER):
+        os.makedirs(MULTI_MNIST_FOLDER)
+
+    background = (read_image(args.bg_path, args.bg_max_intensity)
+                  if args.bg_path != "" else None)
+
+    # dataset = input_data.read_data_sets(MNIST_FOLDER, validation_size=0)
+    # dataset = np.load(
+    #     os.path.join(MNIST_FOLDER, "dsprites_ndarray_co1sh3sc6or40x32y32_64x64.npz"))
+
+    # images = dataset['imgs']
+    # images = images.astype(np.float32)
+
+    # latentvalue = dataset['latents_values']
+    # labels_dataset = dataset['latents_classes']
+    # unique = np.logical_and(latentvalue[:, -1] < 0.001, latentvalue[:, -2] < 0.001)
+    # unique = np.logical_and(unique, latentvalue[:, 2] > 0.99)
+    # images = images[unique]
+    # print(images.shape)
+    # labels_dataset = labels_dataset[unique]
+    # np.savez(os.path.join(MNIST_FOLDER, "data.npz"), imgs=images, label=labels_dataset)
+    # exit()
+
+    dataset = np.load(os.path.join(MNIST_FOLDER, "data.npz"))
+    images = dataset['imgs']
+    labels_dataset = dataset['label']
+    images = images[:, :IMAGE_SIZE, :IMAGE_SIZE]
+
+    # reduce_max = np.max(images, 0)
+    # crop_non_empty(reduce_max)
+    # exit(0)
+
+    pile_image(
+        np.reshape(images[:120], [120, IMAGE_SIZE, IMAGE_SIZE, 1]),
+        "visualize_dat.png",
+    )
+
+    common_images, common_indices, common_positions = [], [], []
+    common_boxes, common_labels, common_digits = [], [], []
+
+    np.random.seed(0)
+
+    next_digit_id = 0
+    used_digit_ids = set([])
+    digit_ids = [i for i in range(len(images))]
+    digit_ids = np.random.permutation(digit_ids)
+
+    for num_digits in range(0, args.max_digits + 1):
+        strata_images, strata_indices = [], []
+        strata_positions, strata_boxes = [], []
+        strata_labels = []
+
+        print()
+        print("Generating {} digit images...".format(num_digits))
+        for item in range(args.images_per_digit):
+            # print(item)
+            img, ids, pos, box = generate_multi_image(
+                images,
+                num_digits,
+                IMAGE_SIZE,
+                CANVAS_SIZE,
+                bg=background,
+                min_w=args.min_width_scale,
+                max_w=args.max_width_scale,
+                min_h=args.min_height_scale,
+                max_h=args.max_height_scale,
+                min_ang=args.min_rotation_angle,
+                max_ang=args.max_rotation_angle,
+                gap=args.digit_gap,
+                margin=args.canvas_margin,
+                use_pixel_overlap=(not args.use_bounding_box_overlap),
+                location_constrains=CONSTRAINS,
+                share_size=args.shared_size,
+            )
+
+            if num_digits in NUM_IN_COMMON:
+                for digit_id in ids:
+                    used_digit_ids.add(digit_id)
+
+            strata_images.append(img)
+            strata_indices.append(ids)
+            strata_positions.append(pos)
+            strata_boxes.append(box)
+            strata_labels.append(list(labels_dataset[ids]))
+
+            if (item + 1) % 1000 == 0:
+                print("{0} done".format(item + 1))
+        print()
+
+        # save_images = np.concatenate(
+        #     [np.reshape(item, [1, 50, 50, 1]) for item in strata_images[:100]], axis=0)
+        # plot_image(save_images,
+        #            MULTI_MNIST_FOLDER + name_of_common + str(num_digits) + ".pdf")
+
+        strata_digits = [num_digits] * args.images_per_digit
+
+        if num_digits in NUM_IN_COMMON:
+            common_images.extend(strata_images)
+            common_indices.extend(strata_indices)
+            common_positions.extend(strata_positions)
+            common_boxes.extend(strata_boxes)
+            common_labels.extend(strata_labels)
+            common_digits.extend(strata_digits)
+
+        if SAVER_TFRECORDS is True:
+            print("Writing {} digit images... ".format(num_digits), end="", flush=True)
+            write_to_records(
+                MULTI_MNIST_FOLDER + str(num_digits),
+                strata_images,
+                strata_indices,
+                strata_positions,
+                strata_boxes,
+                strata_labels,
+                strata_digits,
+            )
+            print("done")
+
+        if num_digits == max(NUM_IN_COMMON):
+            common_images, common_indices, common_positions, common_boxes, common_labels, common_digits = shuffle_lists(
+                common_images,
+                common_indices,
+                common_positions,
+                common_boxes,
+                common_labels,
+                common_digits,
+            )
+
+            print()
+            print("{0} MNIST digits used for 0-{1} digit images".format(
+                len(used_digit_ids), name_of_common))
+            print(
+                "Writing 0-{} digit images to common file... ".format(name_of_common),
+                end="",
+                flush=True,
+            )
+            write_to_records(
+                MULTI_MNIST_FOLDER + "common" + name_of_common,
+                common_images[args.test_set_size:],
+                common_indices[args.test_set_size:],
+                common_positions[args.test_set_size:],
+                common_boxes[args.test_set_size:],
+                common_labels[args.test_set_size:],
+                common_digits[args.test_set_size:],
+            )
+            print("done")
+
+            print(
+                "Writing 0-{} digit images to test file... ".format(name_of_common),
+                end="",
+                flush=True,
+            )
+            write_to_records(
+                MULTI_MNIST_FOLDER + "test" + name_of_common,
+                common_images[:args.test_set_size],
+                common_indices[:args.test_set_size],
+                common_positions[:args.test_set_size],
+                common_boxes[:args.test_set_size],
+                common_labels[:args.test_set_size],
+                common_digits[:args.test_set_size],
+            )
+
+            pile_image(
+                np.reshape(common_images[:100], [100, 64, 64, 1]),
+                "visualize_gen.png",
+            )
+
+            print("done")
